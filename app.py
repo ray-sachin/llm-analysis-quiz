@@ -174,7 +174,7 @@ def solve_and_submit_quiz(email, secret, start_url, overall_timeout=180):
         try:
             # load page with Playwright
             with sync_playwright() as p:
-                browser = p.firefox.launch(headless=True)
+                browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
                 page.goto(current_url, timeout=60_000)
                 page.wait_for_timeout(2000)
