@@ -178,7 +178,7 @@ def solve_and_submit_quiz(email, secret, start_url, overall_timeout=180):
                 page = browser.new_page()
                 page.goto(current_url, timeout=60_000)
                 page.wait_for_timeout(2000)
-                page_text = page.inner_text("body")
+                page_text = page.content()
                 browser.close()
 
             # detect task
