@@ -1,3 +1,4 @@
+# app.py (fixed version)
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 import requests
@@ -10,59 +11,62 @@ from openai import OpenAI
 import os
 import base64
 import matplotlib.pyplot as plt
-import io
 import random
+import time
+import traceback
 
 load_dotenv()
+
+# LLM client -- configured for aiPipe (keep if that's your provider)
 client = OpenAI(
     api_key=os.getenv("AIPIPE_TOKEN"),
-    base_url="https://aipipe.org/openai/v1"  # This is critical for aiPipe!
+    base_url="https://aipipe.org/openai/v1"
 )
 
 def decide_task(question_text):
     """
     Uses LLM to analyze the question text and decide what type of task this is.
-    Returns one of: 'pdf_sum', 'csv_sum', 'api_fetch', 'visualization', 'text_analysis', etc.
+    Returns a single category string (lowercase).
     """
     prompt = f"""
-    You are an AI agent helping to categorize quiz questions into task types.
-    Question:
-    {question_text}
+You are an AI agent helping to categorize quiz questions into task types.
+Question:
+{question_text}
 
-    Choose the most likely category:
-    1. pdf_sum → involves summing or extracting data from a PDF file
-    2. csv_sum → involves summing or filtering data from a CSV or Excel file
-    3. api_fetch → involves calling an API or extracting from JSON
-    4. visualization → involves generating a chart or base64 image
-    5. text_analysis → involves extracting or counting from plain text
-
-    Respond ONLY with one category name.
-    """
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    category = response.choices[0].message.content.strip().lower()
-    return category
+Choose the most likely category (respond with exactly one of the following words):
+pdf_sum, csv_sum, api_fetch, visualization, text_analysis
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=16
+        )
+        category = response.choices[0].message.content.strip().lower()
+        return category
+    except Exception:
+        # fallback heuristic
+        txt = question_text.lower()
+        if "pdf" in txt or "page" in txt:
+            return "pdf_sum"
+        if "csv" in txt or "excel" in txt or ".csv" in txt:
+            return "csv_sum"
+        if "chart" in txt or "plot" in txt or "visualize" in txt:
+            return "visualization"
+        return "text_analysis"
 
 def solve_quiz(page_text: str):
     """
-    Looks through the quiz text for a downloadable file,
-    downloads it, tries to find a table, and sums the 'value' column.
-    Returns either (answer, reason).
+    Finds a downloadable file link in the page_text and tries to parse it.
+    Returns (answer, reason) where reason is None on success, otherwise a string.
     """
-    # find a downloadable link
-    import re
-    link_match = re.search(r'https?://[^\s"]+\.(pdf|csv|xlsx?)', page_text)
+    link_match = re.search(r'https?://[^\s"<>]+?\.(pdf|csv|xlsx|xls)', page_text, flags=re.IGNORECASE)
     if not link_match:
         return None, "No file link found."
 
     file_url = link_match.group(0)
     file_type = file_url.split(".")[-1].lower()
 
-    # download the file
     try:
         resp = requests.get(file_url, timeout=30)
         resp.raise_for_status()
@@ -72,170 +76,203 @@ def solve_quiz(page_text: str):
     try:
         if file_type == "pdf":
             with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-                # crude: assume page 2 exists
+                if len(pdf.pages) < 2:
+                    return None, "PDF does not have page 2."
                 tables = pdf.pages[1].extract_tables()
-                df = pd.DataFrame(tables[0][1:], columns=tables[0][0])
-        elif file_type in ("csv", "xlsx", "xls"):
-            if file_type == "csv":
-                df = pd.read_csv(io.BytesIO(resp.content))
-            else:
-                df = pd.read_excel(io.BytesIO(resp.content))
+                if not tables or not tables[0]:
+                    return None, "No table found on page 2."
+                header = tables[0][0]
+                rows = tables[0][1:]
+                df = pd.DataFrame(rows, columns=header)
+        elif file_type == "csv":
+            # allow pandas to read from bytes
+            df = pd.read_csv(io.BytesIO(resp.content))
+        elif file_type in ("xlsx", "xls"):
+            df = pd.read_excel(io.BytesIO(resp.content))
         else:
             return None, "Unsupported file type."
 
-        # clean column names
-        df.columns = [c.strip().lower() for c in df.columns]
+        # normalize columns
+        df.columns = [str(c).strip().lower() for c in df.columns]
 
         if "value" not in df.columns:
-            return None, f"'value' column not found. Columns: {df.columns}"
+            return None, f"'value' column not found. Columns: {list(df.columns)}"
 
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        answer = int(df["value"].sum())
+        total = df["value"].sum(skipna=True)
+        # if float but integral, cast to int
+        if pd.isna(total):
+            return None, "Sum resulted in NaN."
+        if abs(total - int(total)) < 1e-9:
+            answer = int(total)
+        else:
+            answer = float(total)
 
         return answer, None
     except Exception as e:
         return None, f"Error parsing data: {e}"
 
-
-app = Flask(__name__)
-
-SECRET = os.getenv("SECRET")
-
-@app.route("/api", methods=["POST"])
-
-def generate_chart_base64(chart_type="bar"):
+def generate_chart_base64(chart_type="bar", width=600, height=360, dpi=80):
     """
-    Generates a sample chart (bar/line/pie) and returns its Base64 string.
-    Replace the dummy data with real quiz data later.
+    Generates a chart (default bar) and returns a base64 data URI.
+    The function attempts to ensure the final base64 payload is < 1MB; if not,
+    it will downscale the image once before returning.
     """
-    # Dummy data for demo
+    # Dummy data for demo (replace with quiz data in real solver)
     categories = ["A", "B", "C", "D"]
     values = [random.randint(10, 80) for _ in categories]
 
-    # Create chart
-    fig, ax = plt.subplots(figsize=(5, 3))
-    if chart_type == "bar":
-        ax.bar(categories, values)
-    elif chart_type == "line":
-        ax.plot(categories, values, marker='o')
-    elif chart_type == "pie":
-        ax.pie(values, labels=categories, autopct='%1.1f%%')
-    else:
-        ax.bar(categories, values)
+    def _create_image(w, h, d):
+        fig, ax = plt.subplots(figsize=(w / d, h / d), dpi=d)
+        if chart_type == "bar":
+            ax.bar(categories, values)
+        elif chart_type == "line":
+            ax.plot(categories, values, marker='o')
+        elif chart_type == "pie":
+            ax.pie(values, labels=categories, autopct='%1.1f%%')
+        else:
+            ax.bar(categories, values)
+        ax.set_title(f"{chart_type.title()} Chart")
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
 
-    ax.set_title(f"{chart_type.title()} Chart Example")
-    plt.tight_layout()
+    # Create image and check size
+    img_bytes = _create_image(width, height, dpi)
+    image_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    # If > 1MB (about 1,000,000 chars), downscale once
+    if len(image_b64) > 950_000:
+        # downscale
+        img_bytes = _create_image(int(width * 0.6), int(height * 0.6), dpi)
+        image_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-    # Save to memory
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close(fig)
-    buf.seek(0)
-
-    # Convert to Base64 string
-    image_b64 = base64.b64encode(buf.read()).decode("utf-8")
+    # final check
+    if len(image_b64) > 1_000_000:
+        return None  # too large to include
     return f"data:image/png;base64,{image_b64}"
 
-def solve_and_submit_quiz(email, secret, start_url):
+def solve_and_submit_quiz(email, secret, start_url, overall_timeout=180):
     """
-    Solves a quiz, submits the answer, and continues automatically
-    if the response includes a 'url' for the next quiz.
+    Solves quizzes in a chain; enforces an overall timeout (seconds).
+    Returns a list of result dicts (chain_log).
     """
+    start_time = time.time()
+    deadline = start_time + overall_timeout
+
     current_url = start_url
-    chain_log = []  # to store results of each quiz
+    chain_log = []
 
     while current_url:
+        # enforce overall timeout
+        if time.time() > deadline:
+            chain_log.append({"quiz_url": current_url, "error": "Overall timeout exceeded (3 minutes)."})
+            break
+
         try:
-            # --- Load quiz page ---
+            # load page with Playwright
             with sync_playwright() as p:
                 browser = p.firefox.launch(headless=True)
                 page = browser.new_page()
-                page.goto(current_url, timeout=60000)
+                page.goto(current_url, timeout=60_000)
                 page.wait_for_timeout(2000)
                 page_text = page.inner_text("body")
                 browser.close()
 
-            # --- Decide type of task ---
+            # detect task
             category = decide_task(page_text)
-            print(f"🤖 Solving quiz at {current_url} | Category: {category}")
+            print(f"Solving {current_url} | category: {category}")
 
-            # --- Choose solver ---
             if "pdf" in category or "csv" in category:
                 answer, reason = solve_quiz(page_text)
+                if answer is None:
+                    # failed to solve; record reason and stop or attempt re-submit fallback
+                    chain_log.append({"quiz_url": current_url, "correct": False, "reason": reason})
+                else:
+                    pass  # answer ready
             elif "visualization" in category:
-                answer, reason = generate_chart_base64("bar"), None
+                answer = generate_chart_base64("bar")
+                if answer is None:
+                    chain_log.append({"quiz_url": current_url, "correct": False, "reason": "Visualization too large to submit."})
             else:
-                answer, reason = "test", "default fallback"
+                # fallback: simple text parsing or fail-safe
+                answer = "test"
+                reason = "fallback"
 
-            # --- Find submit URL ---
-            submit_url_match = re.search(r'https://[^\s"]+/submit', page_text)
+            # find submit URL on page (do not hardcode)
+            submit_url_match = re.search(r'https?://[^\s"<>]+/submit', page_text, flags=re.IGNORECASE)
             if not submit_url_match:
-                chain_log.append({"url": current_url, "status": "No submit URL found"})
+                chain_log.append({"quiz_url": current_url, "error": "Submit URL not found on page."})
                 break
-
             submit_url = submit_url_match.group(0)
 
-            # --- Submit answer ---
-            answer_payload = {
+            # ensure answer size under 1MB (encoded)
+            payload = {
                 "email": email,
                 "secret": secret,
                 "url": current_url,
                 "answer": answer
             }
 
-            response = requests.post(submit_url, json=answer_payload, timeout=30)
+            # quick size check (approx)
+            import json
+            payload_text = json.dumps(payload)
+            if len(payload_text.encode("utf-8")) > 1_000_000:
+                chain_log.append({"quiz_url": current_url, "error": "Payload too large (>1MB)."})
+                break
+
+            # submit
+            response = requests.post(submit_url, json=payload, timeout=30)
             result = response.json()
 
-            # --- Record result ---
             chain_log.append({
                 "quiz_url": current_url,
+                "submit_url": submit_url,
                 "correct": result.get("correct"),
                 "reason": result.get("reason"),
                 "next_url": result.get("url")
             })
 
-            # --- Continue or stop ---
+            # follow next_url if present and still within time
             next_url = result.get("url")
             if not next_url:
-                print("✅ No more quizzes left — chain completed.")
                 break
-            else:
-                print(f"➡️ Moving to next quiz: {next_url}")
-                current_url = next_url
+            current_url = next_url
 
-        except Exception as e:
-            chain_log.append({"url": current_url, "error": str(e)})
+        except Exception as exc:
+            # catch any error and include traceback for easier debug (not exposing secrets)
+            tb = traceback.format_exc()
+            chain_log.append({"quiz_url": current_url, "error": str(exc), "trace": tb})
             break
 
     return chain_log
 
+# Flask app
+app = Flask(__name__)
+SECRET = os.getenv("SECRET")
+
+@app.route("/api", methods=["POST"])
 def handle_request():
+    # parse JSON safely
     try:
         data = request.get_json(force=True)
     except Exception as e:
         return jsonify({"error": "Invalid JSON", "details": str(e)}), 400
 
-    # Basic validation
     if not all(k in data for k in ["email", "secret", "url"]):
         return jsonify({"error": "Missing required fields"}), 400
 
     if data["secret"] != SECRET:
         return jsonify({"error": "Invalid secret"}), 403
 
-    # Start solving (and auto-chain)
-    chain_log = solve_and_submit_quiz(
-        email=data["email"],
-        secret=data["secret"],
-        start_url=data["url"]
-    )
+    # run solver & chain (enforce 3 minute deadline here as well)
+    chain_log = solve_and_submit_quiz(email=data["email"], secret=data["secret"], start_url=data["url"], overall_timeout=180)
 
-    return jsonify({
-        "message": "Quiz chain executed successfully!",
-        "chain_log": chain_log
-    }), 200
-
+    return jsonify({"message": "Quiz chain executed", "chain_log": chain_log}), 200
 
 if __name__ == "__main__":
-    import os
+    # production friendly binding (Railway / Docker / etc.)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
