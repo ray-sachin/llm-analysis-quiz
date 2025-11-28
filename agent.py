@@ -2,7 +2,7 @@ from langgraph.graph import StateGraph, END, START
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langgraph.prebuilt import ToolNode
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from tools import get_rendered_html, download_file, post_request, run_code, add_dependencies
+from tools import get_rendered_html, download_file, post_request, run_code, add_dependencies, transcribe_media
 from typing import TypedDict, Annotated, List, Any
 from langchain.chat_models import init_chat_model
 from langgraph.graph.message import add_messages
@@ -20,7 +20,7 @@ class AgentState(TypedDict):
     messages: Annotated[List, add_messages]
 
 
-TOOLS = [run_code, get_rendered_html, download_file, post_request, add_dependencies]
+TOOLS = [run_code, get_rendered_html, download_file, post_request, add_dependencies, transcribe_media]
 
 
 # -------------------------------------------------
@@ -62,6 +62,7 @@ GENERAL RULES:
 - NEVER re-submit unless the server explicitly allows or it's within the 3-minute limit.
 - ALWAYS inspect the server response before deciding what to do next.
 - ALWAYS use the tools provided to fetch, scrape, download, render HTML, or send requests.
+- ALWAYS use `transcribe_media` for any audio or image files. Do NOT try to write Python code to process media files.
 
 TIME LIMIT RULES:
 - Each task has a hard 3-minute limit.
